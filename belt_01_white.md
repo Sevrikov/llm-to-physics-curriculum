@@ -41,7 +41,7 @@ winget install Ollama.Ollama
 
 # Після встановлення — завантажити моделі
 ollama pull qwen2.5:7b        # основна для роботи (4GB)
-ollama pull qwen2.5:0.5b      # маленька для швидких тестів (0.4GB)
+ollama pull qwen2.5:1.5b      # для класифікатора/роутера (1GB) — 0.5b занадто слабка!
 
 # Перевірка
 ollama run qwen2.5:7b "Привіт! Розкажи про себе одним реченням."
@@ -52,7 +52,7 @@ ollama run qwen2.5:7b "Привіт! Розкажи про себе одним �
 ```bash
 conda create -n white_belt python=3.11
 conda activate white_belt
-pip install openai anthropic ollama python-dotenv rich tqdm pandas
+pip install openai anthropic ollama python-dotenv rich tqdm pandas tiktoken pydantic
 ```
 
 #### Крок 3: `.env` файл (ніколи не коммітити в git!)
@@ -68,27 +68,46 @@ ANTHROPIC_API_KEY=sk-ant-...   # console.anthropic.com → API keys
 ```python
 # experiments/00_setup_check.py
 import os
+import sys
 from dotenv import load_dotenv
-import ollama
 from openai import OpenAI
 
 load_dotenv()
 
+# ── Валідація ключів (впаде до будь-якого API виклику) ─────────────────────
+if not os.getenv("OPENAI_API_KEY"):
+    print("⛔ OPENAI_API_KEY не знайдено! Перевір .env файл.")
+    sys.exit(1)
+
 print("=== ПЕРЕВІРКА СЕРЕДОВИЩА ===\n")
+
+# ── Лайфхак: один клієнт для і хмари і Ollama ─────────────────────────────
+# Ollama сумісний з OpenAI API на порту 11434.
+# В реальних проектах використовуй ТАК — менше імпортів, менше плутанини:
+#
+#   cloud_client = OpenAI()
+#   local_client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+#
+# В цьому модулі для наочності залишаємо бібліотеку ollama як є.
 
 # 1. Локальна модель (безкоштовно)
 print("1. Ollama (локально)...")
-resp = ollama.chat(
-    model='qwen2.5:7b',
-    messages=[{'role': 'user', 'content': 'Скажи "OK" якщо працюєш.'}]
-)
-print(f"   Qwen-7B: {resp['message']['content']}\n")
+try:
+    import ollama
+    resp = ollama.chat(
+        model='qwen2.5:7b',
+        messages=[{'role': 'user', 'content': 'Скажи "OK" якщо працюєш.'}]
+    )
+    print(f"   Qwen-7B: {resp['message']['content']}\n")
+except Exception as e:
+    print(f"   ⚠️  Ollama недоступна: {e}")
+    print("   Переконайся що 'ollama serve' запущено.\n")
 
 # 2. OpenAI API (платно, ~$0.001 за цей запит)
 print("2. OpenAI API...")
 client = OpenAI()
 resp = client.chat.completions.create(
-    model="gpt-4o-mini",  # дешевший варіант для тестів
+    model="gpt-4o-mini",
     messages=[{"role": "user", "content": "Скажи 'OK' якщо працюєш."}]
 )
 print(f"   GPT-4o-mini: {resp.choices[0].message.content}\n")
@@ -100,7 +119,9 @@ print("✅ Все готово до бою!")
 
 ### День 2–4: ПЕРШИЙ БІЙ — «Сліпе порівняння» (16 годин)
 
-**Мета:** Побачити реальну різницю між моделями. Зрозуміти де gap для твоєї ніші.
+**Мета:** Зафіксувати baseline — що моделі дають БЕЗ жодного промпту. Ця точка відліку покаже реальний прогрес від твоїх промптів пізніше. Без baseline неможливо довести що ти щось покращив.
+
+> ⚡ **Принцип:** Спочатку побачити провал — потім виправляти. Ніколи навпаки.
 
 ```python
 # experiments/01_first_fight.py
@@ -575,10 +596,15 @@ for item in COMPLEX_QUESTIONS:
 ```
 
 **Теорія після (15 хвилин):**
-CoT змушує модель «займати місце» в контексті для проміжних міркувань. Attention механізм потім використовує ці міркування як додатковий контекст для фінальної відповіді. Це не «магія» — це розширення ефективного контексту.
 
-**Коли CoT допомагає:** математика, логічні задачі, багатокрокові рішення, порівняння варіантів.  
-**Коли CoT не потрібен:** прості факти, класифікація, short QA.
+⚠️ **Важливо: модель НЕ «думає кроками»** — це поширена помилка.
+
+Модель генерує токени послідовно, один за одним. CoT — інженерний прийом: ти змушуєш модель виробляти проміжний текст (розрахунки, перелік фактів, умови) перед фінальною відповіддю. Оскільки кожен наступний токен «бачить» всі попередні через Attention, довший проміжний контекст статистично покращує якість фінального токену.
+
+Аналогія: якщо попросити людину «порахуй в умі 23×47» — більшість помиляться. Але якщо попросити «запиши проміжні кроки» — якість зростає. Не тому що мозок «думає по-іншому», а тому що є де фіксувати проміжні стани.
+
+**Коли CoT допомагає:** математика, логічні задачі, багатокрокові рішення, порівняння кількох сценаріїв.  
+**Коли CoT не потрібен:** прості факти, класифікація одним словом, short QA — тут CoT лише збільшує токени і вартість.
 
 ---
 
@@ -622,14 +648,21 @@ def parse_naive(question: str) -> Optional[dict]:
 # РІВЕНЬ 2: Надійний парсер (витягує JSON з будь-якого тексту)
 # ============================================================
 def extract_json_from_text(text: str) -> Optional[dict]:
-    """Витягнути JSON навіть якщо він огорнутий в markdown або текст"""
-    # Спробувати напряму
+    """Витягнути JSON навіть якщо він огорнутий в markdown або текст.
+    
+    Три рівні пошуку:
+    1. Прямий json.loads
+    2. JSON всередині ```json ... ``` блоку
+    3. raw_decode — знаходить перший { } блок включно з nested JSON
+       (на відміну від regex r'\{[^{}]*\}' який ламається на вкладених об'єктах!)
+    """
+    # 1. Спробувати напряму
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError:
         pass
     
-    # Витягти з ```json ... ``` блоку
+    # 2. Витягти з ```json ... ``` блоку
     match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
     if match:
         try:
@@ -637,13 +670,16 @@ def extract_json_from_text(text: str) -> Optional[dict]:
         except json.JSONDecodeError:
             pass
     
-    # Витягти перший { ... } блок
-    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+    # 3. raw_decode: знаходить перший валідний JSON об'єкт (підтримує nested!)
+    #    r'\{[^{}]*\}' — АНТИПАТТЕРН: виріже тільки внутрішній об'єкт у {"a": {"b": 1}}
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch == '{':
+            try:
+                obj, _ = decoder.raw_decode(text, i)
+                return obj
+            except json.JSONDecodeError:
+                continue
     
     return None
 
@@ -737,9 +773,66 @@ for q in test_questions:
     print(f"Результат: {json.dumps(result, ensure_ascii=False, indent=2)}")
 ```
 
+**💡 Сучасний стандарт (2025+): Pydantic Structured Outputs**
+
+Весь код вище з `extract_json_from_text` + retry — це обхідний шлях. Сучасний підхід через OpenAI Structured Outputs **гарантує валідний JSON на рівні рушія моделі** — жодних regex, жодних retry для парсингу:
+
+```python
+# experiments/06b_pydantic_structured.py
+"""
+Сучасний підхід: Pydantic + response_format.
+Модель гарантовано поверне валідний JSON під схему — без regex.
+"""
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing import List
+
+client = OpenAI()
+
+# 1. Схема даних — модель заповнить її гарантовано
+class LegalAnalysis(BaseModel):
+    category: str = Field(description="Категорія: wage_delay | wrongful_termination | vacation | contract | other")
+    urgency:  str = Field(description="Терміновість: high | medium | low")
+    short_answer: str = Field(description="Відповідь 1-2 речення українською")
+    recommended_actions: List[str] = Field(description="Конкретні кроки для захисту прав")
+    confidence: str = Field(description="Рівень впевненості: high | medium | low")
+
+def get_structured_analysis(question: str) -> LegalAnalysis:
+    try:
+        response = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ти старший юрист по трудовому праву України."},
+                {"role": "user",   "content": question}
+            ],
+            response_format=LegalAnalysis,  # ← модель сама валідує під схему
+            temperature=0.1
+        )
+        return response.choices[0].message.parsed
+
+    except Exception as e:
+        print(f"Помилка: {e}")
+        # Безпечний fallback — завжди повертаємо валідний об'єкт
+        return LegalAnalysis(
+            category="other", urgency="medium",
+            short_answer="Технічна помилка. Зверніться до юриста.",
+            recommended_actions=["Звернутись до спеціаліста вручну"],
+            confidence="low"
+        )
+
+# Тест
+analysis = get_structured_analysis("Затримали зарплату 3 тижні. Що робити?")
+print(analysis.model_dump_json(indent=2, ensure_ascii=False))
+# → гарантований валідний JSON, без жодного regex!
+```
+
+> **Правило для продакшну:** якщо є доступ до OpenAI API — завжди `response_format=PydanticModel`. Regex-парсинг — лише для локальних моделей де Pydantic недоступний.
+
 ---
 
-### Техніка 5: «Cost-Quality Router» (8 годин)
+### Техніка 5: «Cost-Quality Router» (8 годин) *(Yellow Belt preview)*
+
+> 🎯 **Контекст рівня:** Повноцінний production-router — це Жовтий пояс. Тут ми будуємо спрощену версію щоб зрозуміти *принцип*. Не намагайся зробити це ідеально — головне побачити ідею routing між моделями.
 
 **Проблема яку вирішує:** GPT-4o коштує в 20x більше ніж gpt-4o-mini або локальна модель. Більшість питань не вимагають найпотужнішої моделі.
 
@@ -763,30 +856,36 @@ COSTS = {
 
 def classify_complexity(question: str) -> str:
     """
-    Визначити складність питання: simple / medium / complex
-    Використовуємо найдешевшу модель для класифікації!
+    Визначити складність питання: simple / medium / complex.
+    
+    ⚠️ Мінімум 1.5B: 0.5B моделі ненадійно класифікують,
+    особливо українською — повертають зайвий текст замість одного слова.
+    
+    ⚠️ startswith замість 'in': перевірка 'simple' in answer дає false positive
+    на фрази типу "This is a simple case, but..." → треба перше слово.
     """
     resp = ollama.chat(
-        model='qwen2.5:0.5b',  # найменша модель для класифікації
+        model='qwen2.5:1.5b',  # мінімум 1.5B для надійної класифікації
         messages=[
-            {'role': 'system', 'content': """Класифікуй складність юридичного питання.
-Відповідай ТІЛЬКИ одним словом: simple, medium, або complex.
+            {'role': 'system', 'content': """Classify the complexity of a legal question.
+Reply with ONLY one word: simple, medium, or complex.
 
-simple: факт про один закон, пряма відповідь
-medium: потрібно розглянути 2-3 аспекти
-complex: розрахунки, кілька сценаріїв, суперечливі норми"""},
+simple: one law fact, direct answer
+medium: 2-3 aspects to consider
+complex: calculations, multiple scenarios, conflicting norms"""},
             {'role': 'user', 'content': question}
         ]
     )
-    answer = resp['message']['content'].strip().lower()
-    if 'simple' in answer:
+    # Беремо перше слово — захист від "simple, because..." або "It's complex"
+    first_word = resp['message']['content'].strip().lower().split()[0] if resp['message']['content'].strip() else ''
+    if first_word.startswith('simple'):
         return 'simple'
-    elif 'complex' in answer:
+    elif first_word.startswith('complex'):
         return 'complex'
     return 'medium'
 
 def smart_answer(question: str, system_prompt: str) -> dict:
-    """Відповісти використовуючи оптимальну модель"""
+    """Відповісти використовуючи оптимальну модель для даної складності."""
     
     complexity = classify_complexity(question)
     
@@ -828,12 +927,20 @@ def smart_answer(question: str, system_prompt: str) -> dict:
         )
         answer = resp.choices[0].message.content
     
+    # ⚠️ len(answer) — символи, НЕ токени! Для UA тексту ~2.5 символи/токен.
+    # Плюс завжди рахуй INPUT tokens (системний промпт може коштувати більше ніж вивід!)
+    est_out_tokens = len(answer) / 2.5
+    est_in_tokens  = (len(question) + len(system_prompt)) / 2.5
+    est_cost = COSTS[model_used] * (est_in_tokens + est_out_tokens) / 1_000_000
+    # Для точного підрахунку: pip install tiktoken → tiktoken.encoding_for_model("gpt-4o")
+
     return {
         "question": question,
         "complexity": complexity,
         "model_used": model_used,
         "answer": answer,
-        "estimated_cost_usd": COSTS[model_used] * len(answer) / 1_000_000
+        "estimated_cost_usd": est_cost,
+        "est_tokens": {"input": int(est_in_tokens), "output": int(est_out_tokens)}
     }
 
 # Тест на 10 питаннях
@@ -875,12 +982,37 @@ print(f"Якби завжди GPT-4o: значно дорожче")
 - Cost routing (Техніка 5)
 """
 import json
-import ollama
-from openai import OpenAI
-from typing import Optional
+import os
 import re
+import sys
+import time
+from typing import Optional
+
+import ollama
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+if not os.getenv("OPENAI_API_KEY"):
+    print("⛔ OPENAI_API_KEY не знайдено! Перевір .env файл.")
+    sys.exit(1)
 
 client = OpenAI()
+
+
+# ── Ollama з retry: захист від connection reset і "model not ready" ─────────
+def ollama_safe(model: str, messages: list, max_retries: int = 3) -> dict:
+    """Викликає ollama.chat з автоматичним retry при збоях."""
+    for attempt in range(max_retries):
+        try:
+            return ollama.chat(model=model, messages=messages)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"  [ollama retry {attempt+1}/{max_retries}] {e}")
+                time.sleep(1.5)
+            else:
+                raise RuntimeError(f"Ollama failed after {max_retries} retries: {e}")
 
 # ============================================================
 # НАЛАШТУЙ ПІД СВОЮ НІШУ
@@ -918,47 +1050,56 @@ FEW_SHOT_EXAMPLES = [
 ]
 
 def answer(question: str, use_cot: bool = False) -> dict:
-    """Основна функція відповіді"""
+    """Основна функція відповіді з routing по складності."""
     
-    # Визначити складність
-    complexity_resp = ollama.chat(
-        model='qwen2.5:0.5b',
+    # ── Визначити складність (1.5B мінімум, startswith — не 'in'!) ──────────
+    complexity_resp = ollama_safe(
+        model='qwen2.5:1.5b',
         messages=[
-            {'role': 'system', 'content': 'Відповідай одним словом: simple, medium, або complex.'},
+            {'role': 'system', 'content': 'Reply with ONLY one word: simple, medium, or complex.'},
             {'role': 'user', 'content': question}
         ]
     )
-    raw = complexity_resp['message']['content'].lower()
-    complexity = 'complex' if 'complex' in raw else ('simple' if 'simple' in raw else 'medium')
+    first_word = complexity_resp['message']['content'].strip().lower().split()[0] \
+                 if complexity_resp['message']['content'].strip() else ''
+    complexity = 'complex' if first_word.startswith('complex') \
+                 else ('simple' if first_word.startswith('simple') else 'medium')
     
-    # Побудувати messages
+    # ── Побудувати messages (всі елементи — dict, не ChatCompletionMessage) ──
     messages = [{"role": "system", "content": NICHE_SYSTEM}]
-    messages.extend(FEW_SHOT_EXAMPLES)
+    messages.extend(FEW_SHOT_EXAMPLES)  # FEW_SHOT_EXAMPLES — список dict
     
     # CoT для складних питань
     if use_cot or complexity == 'complex':
-        question_wrapped = f"""<крок за кроком>
-Проаналізуй покроково: {question}
-</крок за кроком>"""
+        question_wrapped = (
+            f"Проаналізуй покроково, потім дай відповідь у форматі:\n"
+            f"<аналіз>крок 1... крок 2...</аналіз>\n\n**Відповідь:** ...\n\n"
+            f"Питання: {question}"
+        )
     else:
         question_wrapped = question
     
     messages.append({"role": "user", "content": question_wrapped})
     
-    # Вибір моделі
+    # ── Вибір моделі ────────────────────────────────────────────────────────
     if complexity == 'simple':
-        resp = ollama.chat(model='qwen2.5:7b', messages=[
-            {'role': m['role'], 'content': m['content']} for m in messages
-        ])
+        # Ollama-safe з явним .get() — захист від TypeErrors якщо messages змішані
+        resp = ollama_safe(
+            model='qwen2.5:7b',
+            messages=[{'role': m.get('role', 'user'), 'content': m.get('content', '')}
+                      for m in messages]
+        )
         answer_text = resp['message']['content']
         model = 'qwen2.5:7b'
+
     elif complexity == 'medium':
         resp = client.chat.completions.create(
             model="gpt-4o-mini", messages=messages, temperature=0.1
         )
         answer_text = resp.choices[0].message.content
         model = 'gpt-4o-mini'
-    else:
+
+    else:  # complex
         resp = client.chat.completions.create(
             model="gpt-4o", messages=messages, temperature=0.1
         )
@@ -1251,9 +1392,14 @@ my_llm_project/
 | System prompt занадто короткий | Модель ігнорує обмеження | Додати явні ЗАБОРОНИ |
 | Few-shot приклади нерепрезентативні | Модель копіює стиль але не зміст | Вибрати найтиповіші кейси |
 | Немає OOD обробки | Модель відповідає на все підряд | Явна інструкція відмовляти |
-| JSON парсинг без retry | `NoneType` помилки в продакшні | Використовувати `parse_with_retry` |
+| JSON парсинг без retry | `NoneType` помилки в продакшні | Pydantic `response_format` або `parse_with_retry` |
 | Завжди GPT-4o | Дорого без потреби | Впровадити complexity router |
 | Eval set в навчальних даних | Переоцінка результатів | `eval_gold.jsonl` — тільки для оцінки |
+| `qwen2.5:0.5b` для класифікації | Повертає текст замість `simple/medium/complex` | Мінімум `qwen2.5:1.5b` для класифікатора |
+| `'simple' in answer` | False positive на "This is a simple case, but..." | `answer.strip().lower().split()[0].startswith('simple')` |
+| Cost = `len(answer) / 1M` | Вартість занижена в 2–4 рази | `len(text) / 2.5` (токени UA) + рахувати INPUT окремо |
+| `ollama.chat()` без retry | Краш при `connection reset` або `model not ready` | Обернути в `ollama_safe()` з 3 retry |
+| Два окремих клієнти (openai + ollama) | Складний код, плутанина | `OpenAI(base_url="http://localhost:11434/v1")` для локалі |
 
 ---
 
