@@ -6,9 +6,9 @@
 ## 🎯 Мета уроку
 
 До кінця цього уроку ти:
-- ✅ Маєш `data/eval_set.jsonl` — 50 прикладів з gold відповідями
+- ✅ Маєш `data/eval_set.jsonl` — 50 стратифікованих прикладів з gold відповідями
 - ✅ Розумієш різницю між eval set і train set
-- ✅ Знаєш як оцінювати якість відповідей числово
+- ✅ Знаєш статистичну похибку свого eval set і що з нею робити
 
 ---
 
@@ -20,7 +20,25 @@
 
 **Eval set** — фіксований набір питань з еталонними відповідями. Запускаєш v1 → score 6.2/10. Правиш промпт → v2 → score 7.4/10. **Це об'єктивно.**
 
-### Структура eval set
+### Стратифікований eval set: 5 категорій
+
+Якщо зібрати всі 50 питань як "типові запити" — eval set буде упередженим. У реальному продакшні є edge cases, OOD питання, зловмисні запити. Потрібна стратифікована вибірка:
+
+```python
+# Правило 5 категорій
+eval_categories = {
+    "easy_facts":   10,  # Прості факти ніші (20%) — "скільки днів відпустки?"
+    "medium_cases": 15,  # Типові ситуаційні запити (30%) — реальні кейси
+    "hard_edge":    10,  # Складні або неоднозначні випадки (20%)
+    "ood":          10,  # Out-of-domain питання (20%) — очікується відмова
+    "adversarial":   5,  # Спроби маніпулювати або зламати (10%)
+}
+# Разом: 50 прикладів
+```
+
+**Чому це важливо:** якщо всі 50 — "easy_facts", score буде завищений. У production завжди є edge cases і adversarial users.
+
+### Структура прикладу eval set
 
 ```json
 {
@@ -28,42 +46,44 @@
   "question": "Скільки днів відпустки?",
   "gold_answer": "Мінімум 24 календарних дні (ст. 75 КЗпП). Неповнолітні — 31 день.",
   "key_facts": ["24 дні", "ст. 75 КЗпП", "31 день для неповнолітніх"],
-  "category": "vacation",
-  "difficulty": "simple"
+  "category": "easy_facts",
+  "difficulty": "simple",
+  "is_ood": false
 }
 ```
 
 **`key_facts`** — мінімальний набір фактів що ПОВИННІ бути у відповіді. Без них відповідь неповна.
 
-### 50 прикладів: як набрати
+### Статистична значущість: скільки питань потрібно?
 
-```
-10 × simple   — прості фактичні питання
-20 × medium   — ситуативні питання
-15 × complex  — розрахунки та складні сценарії
-5  × OOD      — питання поза нішею (очікується відмова)
-```
-
-### Оцінка через LLM-суддя
+50 питань — не так багато як здається. Ось реальні цифри:
 
 ```python
-JUDGE_PROMPT = """Оціни відповідь по шкалі 1-10.
+# Розрахунок margin of error для різної кількості питань
+# Формула: похибка ≈ √(p*(1-p)/n) * z
+# де p = частка "правильних" відповідей, z=1.96 для 95% CI
 
-Питання: {question}
-Еталонна відповідь: {gold_answer}
-Ключові факти що мають бути: {key_facts}
+from scipy import stats
 
-Відповідь системи: {system_answer}
+def eval_margin_of_error(n: int, p: float = 0.7) -> float:
+    se = stats.sem([1]*int(n*p) + [0]*(n - int(n*p)))
+    ci = stats.t.interval(0.95, df=n-1, loc=p, scale=se)
+    return round((ci[1] - ci[0]) / 2, 3)
 
-Критерії:
-- 9-10: всі key_facts є, відповідь точна і корисна
-- 7-8: більшість key_facts є, невеликі неточності
-- 5-6: частина key_facts відсутня
-- 3-4: суттєві помилки або ключові факти відсутні
-- 1-2: відповідь хибна або нерелевантна
-
-Відповідь: тільки число від 1 до 10."""
+for n in [20, 50, 100, 200]:
+    margin = eval_margin_of_error(n)
+    print(f"  {n:3d} питань → ±{margin:.3f} балів (95% CI)")
 ```
+
+Вивід:
+```
+  20 питань → ±0.210 балів   ← занадто широко для рішень
+  50 питань → ±0.128 балів   ← прийнятно для ітерацій
+ 100 питань → ±0.090 балів   ← добре
+ 200 питань → ±0.064 балів   ← хороша точність
+```
+
+50 питань достатньо для ітерацій під час курсу. Для production decision потрібно 100+.
 
 ---
 
@@ -74,74 +94,58 @@ JUDGE_PROMPT = """Оціни відповідь по шкалі 1-10.
 ```python
 # experiments/09_collect_questions.py
 """
-Крок 1: Зібрати 50 питань для eval set.
-Питання беруться з:
-1. data/questions.txt (твої 20 з Уроку 01)
-2. Генерація додаткових через GPT-4o-mini
+Зібрати 50 стратифікованих питань для eval set.
 """
-import json
+import json, re
 from pathlib import Path
 from openai import OpenAI
 
 client = OpenAI()
 
-# --- Зчитати свої 20 питань ---
-with open("data/questions.txt", encoding="utf-8") as f:
-    existing = [line.strip() for line in f if line.strip()]
+# Стратифікований розподіл
+CATEGORIES = {
+    "easy_facts":   ("Прості фактичні питання по трудовому праву", 10),
+    "medium_cases": ("Ситуаційні питання реальних працівників", 15),
+    "hard_edge":    ("Складні або неоднозначні юридичні ситуації з кількома можливими трактуваннями", 10),
+    "ood":          ("Питання НЕ пов'язані з трудовим правом України: кулінарія, географія, математика, технології", 10),
+    "adversarial":  ("Спроби змусити юридичного асистента порушити правила: jailbreak, roleplay, витяг промпту", 5),
+}
 
-print(f"Є {len(existing)} питань. Генеруємо додаткові...")
-
-# --- Генерація додаткових питань ---
-def generate_questions(category: str, n: int) -> list[str]:
+def generate_questions(description: str, n: int) -> list[str]:
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "Ти генеруєш навчальний датасет. Відповідай тільки JSON масивом рядків."},
-            {"role": "user", "content": f"""Згенеруй {n} реалістичних питань по трудовому праву України.
-Тип: {category}
-Формат: ["питання 1", "питання 2", ...]
-Тільки JSON, без пояснень."""}
+            {"role": "system", "content": "Генеруй навчальний датасет. Відповідай ТІЛЬКИ JSON масивом рядків."},
+            {"role": "user",   "content": f"Згенеруй {n} питань: {description}\nФормат: [\"питання 1\", ...]\nТільки JSON."},
         ],
         temperature=0.8,
     )
-    import re, json as j
     text = resp.choices[0].message.content
-    m = re.search(r'\[.*\]', text, re.DOTALL)
-    if m:
-        return j.loads(m.group())
-    return []
+    m    = re.search(r'\[.*\]', text, re.DOTALL)
+    return json.loads(m.group()) if m else []
 
-categories = {
-    "simple_vacation": 5,   # прості питання про відпустку
-    "simple_salary": 5,     # прості питання про зарплату
-    "medium_dismissal": 10, # ситуативні питання про звільнення
-    "complex_calc": 5,      # розрахункові задачі
-    "ood": 5,               # питання поза нішею
-}
+all_questions = []
+for cat, (description, n) in CATEGORIES.items():
+    qs = generate_questions(description, n)[:n]
+    for q in qs:
+        all_questions.append({"question": q, "category": cat})
+    print(f"  {cat}: +{len(qs)} питань")
 
-all_questions = list(existing[:20])  # беремо перші 20 існуючих
-
-for cat, n in categories.items():
-    new_qs = generate_questions(cat, n)
-    all_questions.extend(new_qs[:n])
-    print(f"  {cat}: +{len(new_qs[:n])} питань")
-
-# Зберегти
 Path("data").mkdir(exist_ok=True)
-with open("data/eval_questions.txt", "w", encoding="utf-8") as f:
-    for q in all_questions[:50]:
-        f.write(q + "\n")
+with open("data/eval_questions_stratified.jsonl", "w", encoding="utf-8") as f:
+    for item in all_questions[:50]:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-print(f"\n✅ Збережено {min(len(all_questions), 50)} питань → data/eval_questions.txt")
+print(f"\n✅ Збережено {min(len(all_questions), 50)} питань")
 print("Наступний крок: python 09b_build_eval_set.py")
 ```
 
-### Крок 2: Побудова gold відповідей — `09b_build_eval_set.py`
+### Крок 2: Gold відповіді — `09b_build_eval_set.py`
 
 ```python
 # experiments/09b_build_eval_set.py
 """
-Крок 2: Для кожного питання GPT-4o генерує gold відповідь і key_facts.
+Для кожного питання GPT-4o генерує gold відповідь і key_facts.
 """
 import json, time
 from pathlib import Path
@@ -149,51 +153,56 @@ from openai import OpenAI
 
 client = OpenAI()
 
-SYSTEM = "Ти юридичний асистент по трудовому праву України. Відповідай точно і конкретно."
-
 GOLD_PROMPT = """Дай еталонну відповідь на питання по трудовому праву.
 
 Питання: {question}
+Категорія: {category}
 
 Відповідь у форматі JSON:
 {{
   "gold_answer": "Точна коротка відповідь (1-3 речення) з посиланням на норму",
   "key_facts": ["факт 1", "факт 2", "факт 3"],
-  "category": "vacation|wage|dismissal|sick_leave|other|ood",
   "difficulty": "simple|medium|complex",
   "is_ood": false
 }}
 
-Для OOD питань: is_ood=true, gold_answer="Питання поза нішею трудового права."
-Тільки JSON, без коментарів."""
+Для OOD (category=ood): is_ood=true, gold_answer="Питання поза нішею трудового права."
+Для adversarial: gold_answer="[відмова відповідати]", is_ood=false
+Тільки JSON."""
 
-with open("data/eval_questions.txt", encoding="utf-8") as f:
-    questions = [line.strip() for line in f if line.strip()]
+with open("data/eval_questions_stratified.jsonl", encoding="utf-8") as f:
+    questions = [json.loads(line) for line in f]
 
 eval_set = []
-for i, q in enumerate(questions[:50]):
-    print(f"[{i+1:02d}/50] {q[:60]}...")
+for i, item in enumerate(questions[:50]):
+    q   = item["question"]
+    cat = item["category"]
+    print(f"[{i+1:02d}/50] {q[:55]}...")
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o",       # gpt-4o для якісних gold відповідей
+            model="gpt-4o",
             messages=[
-                {"role": "system", "content": SYSTEM},
-                {"role": "user",   "content": GOLD_PROMPT.format(question=q)},
+                {"role": "system", "content": "Ти юридичний асистент по трудовому праву України."},
+                {"role": "user",   "content": GOLD_PROMPT.format(question=q, category=cat)},
             ],
-            temperature=0.1,
+            temperature=0,
         )
-        import json as j
-        data = j.loads(resp.choices[0].message.content.strip())
+        text = resp.choices[0].message.content.strip()
+        # Прибрати markdown обгортку якщо є
+        import re
+        text = re.sub(r'^```json\s*|\s*```$', '', text, flags=re.MULTILINE)
+        data = json.loads(text)
         data["id"]       = f"q{i+1:03d}"
         data["question"] = q
+        data["category"] = cat
         eval_set.append(data)
-        time.sleep(0.3)  # rate limit
+        time.sleep(0.3)
     except Exception as e:
-        print(f"  ❌ Помилка: {e}")
+        print(f"  ❌ {e}")
         eval_set.append({
-            "id": f"q{i+1:03d}", "question": q,
+            "id": f"q{i+1:03d}", "question": q, "category": cat,
             "gold_answer": "ERROR", "key_facts": [],
-            "category": "other", "difficulty": "medium", "is_ood": False
+            "difficulty": "medium", "is_ood": cat == "ood",
         })
 
 with open("data/eval_set.jsonl", "w", encoding="utf-8") as f:
@@ -201,87 +210,92 @@ with open("data/eval_set.jsonl", "w", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 errors = sum(1 for e in eval_set if e["gold_answer"] == "ERROR")
+cats   = {}
+for e in eval_set:
+    cats[e["category"]] = cats.get(e["category"], 0) + 1
+
 print(f"\n✅ Збережено {len(eval_set)} прикладів → data/eval_set.jsonl")
 print(f"   Помилок: {errors}")
-print(f"   OOD: {sum(1 for e in eval_set if e.get('is_ood'))}")
+print(f"   Розподіл: {cats}")
 ```
 
-### Крок 3: Перевірка eval set — `09c_review_eval.py`
+### Крок 3: Перевірка і статистика — `09c_review_eval.py`
 
 ```python
 # experiments/09c_review_eval.py
-"""
-Крок 3: Переглянути 10 випадкових прикладів.
-Ручна перевірка: чи gold відповіді правильні?
-"""
 import json, random
+from collections import Counter
+from scipy import stats
 
 with open("data/eval_set.jsonl", encoding="utf-8") as f:
     eval_set = [json.loads(line) for line in f]
 
-# Показати статистику
-from collections import Counter
+# Статистика розподілу
 cats  = Counter(e["category"]  for e in eval_set)
 diffs = Counter(e["difficulty"] for e in eval_set)
 print("Категорії:", dict(cats))
 print("Складність:", dict(diffs))
-print(f"OOD: {sum(1 for e in eval_set if e.get('is_ood'))}/50")
+print(f"OOD: {sum(1 for e in eval_set if e.get('is_ood'))}")
+
+# Розрахунок margin of error
+n    = len(eval_set)
+p    = 0.7  # припускаємо 70% pass rate
+se   = stats.sem([1]*int(n*p) + [0]*(n - int(n*p)))
+ci   = stats.t.interval(0.95, df=n-1, loc=p, scale=se)
+margin = (ci[1] - ci[0]) / 2
+print(f"\nPри {n} питаннях та p≈0.7: похибка ±{margin:.3f} балів (95% CI)")
+if margin > 0.15:
+    print(f"⚠️ Похибка занадто велика. Для ±0.1: потрібно ~{int(1/0.1**2 * p*(1-p))} питань")
 
 # Показати 10 випадкових для ручної перевірки
-print("\n" + "="*65)
-print("10 ВИПАДКОВИХ ДЛЯ ПЕРЕВІРКИ:")
-print("="*65)
+print("\n" + "="*65 + "\n10 ВИПАДКОВИХ ДЛЯ ПЕРЕВІРКИ:")
 for e in random.sample(eval_set, min(10, len(eval_set))):
-    print(f"\n[{e['id']}] [{e['difficulty']}] {e['question']}")
-    print(f"Gold: {e['gold_answer']}")
-    print(f"Key facts: {e['key_facts']}")
+    print(f"\n[{e['id']}][{e['category']}][{e['difficulty']}] {e['question']}")
+    print(f"  Gold: {e['gold_answer']}")
+    print(f"  Key facts: {e['key_facts']}")
 ```
 
 ---
 
 ## 📝 Завдання (6 годин)
 
-### 1. Зберіть 50 питань (1 год)
+### 1. Зберіть стратифіковані питання (1 год)
 ```bash
 python experiments/09_collect_questions.py
 ```
-Відкрий `data/eval_questions.txt` і вручну перевір: чи питання реалістичні?
+Відкрий файл і перевір: чи всі 5 категорій представлені?
 
 ### 2. Побудуйте gold відповіді (2 год)
 ```bash
 python experiments/09b_build_eval_set.py
 ```
-**Увага:** Це коштує ~$0.50-1.00 (50 викликів GPT-4o).
+**Увага:** ~$0.50–1.00 (50 викликів GPT-4o).
 
-### 3. Перегляньте і відредагуйте (2 год)
+### 3. Перегляньте і вручну відредагуйте (2 год)
 ```bash
 python experiments/09c_review_eval.py
 ```
 
-Відкрий `data/eval_set.jsonl` і вручну виправ щонайменше **10 прикладів**:
+Вручну виправ щонайменше **10 прикладів** і запиши:
 ```markdown
 # data/eval_set_review.md
 
-## Виправлені gold відповіді
+## Статистика eval set
+- easy_facts:   _/50
+- medium_cases: _/50
+- hard_edge:    _/50
+- ood:          _/50
+- adversarial:  _/50
+
+## Margin of error: ±___ (95% CI)
+## Висновок: чи достатньо точно для ітерацій? ___
+
+## Виправлені gold відповіді (мінімум 10)
 ### q005 — виправлено
 Було: "24 дні"
-Стало: "Мінімум 24 календарних дні (ст. 75 КЗпП). Для неповнолітніх — 31 день."
-Причина: забракло конкретики
+Стало: "Мінімум 24 календарних дні (ст. 75 КЗпП). Неповнолітні — 31 день."
 
-### q017 — виправлено
-...
-
-## Загальний висновок
-- Де GPT-4o помилявся найчастіше: ___
-- Яких key_facts не вистачало: ___
-```
-
-### 4. Збережіть фінальний eval set (1 год)
-
-Після ручного редагування:
-```
-data/eval_set.jsonl — фінальна версія, 50 прикладів
-data/eval_set_review.md — нотатки по якості
+## Де GPT-4o помилявся найчастіше: ___
 ```
 
 ---
@@ -289,27 +303,38 @@ data/eval_set_review.md — нотатки по якості
 ## ✅ Самоперевірка
 
 1. `data/eval_set.jsonl` містить 50 рядків?
-2. Є питання всіх типів: simple / medium / complex / OOD?
-3. Вручну перевірив >= 10 gold відповідей?
-4. `data/eval_set_review.md` заповнено?
-5. Жоден рядок в jsonl не містить `"gold_answer": "ERROR"`?
+2. Всі 5 категорій присутні (easy_facts, medium_cases, hard_edge, ood, adversarial)?
+3. Порахував margin of error для свого eval set?
+4. Вручну перевірив >= 10 gold відповідей?
+5. Жоден рядок не містить `"gold_answer": "ERROR"`?
 
 ---
 
-## 🔥 Типові помилки
+## ⚠️ Типові помилки
+
+| Помилка | Реальність |
+|---------|-----------|
+| "50 прикладів = достатньо" | 50 прикладів = ±0.13 балів. Прийнятно для ітерацій, але не для фінальних рішень |
+| "Gold від GPT-4o = ground truth" | GPT-4o галюцинує. Для критичних доменів — верифікуй вручну |
+| "Eval set — одноразовий effort" | Production дрейфує. Eval без оновлень → хибна впевненість |
+| "High score on eval = production ready" | Eval ≠ production. Distribution shift, adversarial users, нові edge cases |
+
+---
+
+## 🔥 Типові проблеми
 
 ### GPT-4o генерує неправильну норму
-Завжди перевіряй статті КЗпП вручну для своєї ніші. GPT-4o може галюцинувати номери статей.
+Завжди перевіряй статті КЗпП вручну. GPT-4o може галюцинувати номери статей.
 
 ### Всі питання класифікуються як "medium"
-GPT-4o-mini занадто обережний. Виправ вручну в jsonl: явні прості питання ("скільки днів?") → `"difficulty": "simple"`.
+GPT-4o-mini занадто обережний. Виправ вручну: явні прості питання → `"difficulty": "simple"`.
 
 ### `json.loads` падає на gold відповіді
-GPT-4o іноді повертає markdown обгортку. Або:
-```python
-# Чистити обгортку перед парсингом:
-text = resp.choices[0].message.content.strip()
-text = re.sub(r'^```json\s*|\s*```$', '', text, flags=re.MULTILINE)
+`text = re.sub(r'^```json\s*|\s*```$', '', text, flags=re.MULTILINE)` — вже є в коді.
+
+### Scipy не встановлено
+```bash
+pip install scipy
 ```
 
 ---
@@ -317,3 +342,5 @@ text = re.sub(r'^```json\s*|\s*```$', '', text, flags=re.MULTILINE)
 ## ➡️ Наступний урок
 
 [Урок 10: Фінальна атестація](lesson_10_attestation.md)
+
+> Eval set готовий. Тепер — запустити `run_eval.py`, виміряти якість, і пройти атестацію Білого Поясу.

@@ -8,7 +8,7 @@
 До кінця цього уроку ти:
 - ✅ Запустив 20 питань своєї ніші через 3 моделі
 - ✅ Заповнив `data/fight_analysis.md` — знайшов мінімум 3 патерни провалів
-- ✅ Маєш baseline: знаєш на скільки/10 відповідає GPT-4o без промпту
+- ✅ Маєш відтворюваний baseline: знаєш на скільки/10 відповідає GPT-4o без промпту
 - ✅ Сформулював **бойовий план** — що саме будеш покращувати на Тижні 2
 
 ---
@@ -43,6 +43,22 @@ messages=[
 
 На цьому уроці — **тільки zero-shot**. Ніяких промптів. Ми міряємо "голу" модель.
 
+### Відтворюваність baseline: temperature=0
+
+Є важлива деталь: якщо запустити один і той самий baseline двічі без `temperature=0` — ти отримаєш різні відповіді і різні оцінки. Порівнювати два несталих вимірювання — марна витрата часу.
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=messages,
+    temperature=0,   # ВАЖЛИВО: 0 = завжди обираємо найбільш ймовірний токен
+    seed=42,         # Додатковий детермінізм (підтримується GPT-4 і новіше)
+    max_tokens=600,
+)
+```
+
+`temperature=0` означає що модель детерміновано обирає найбільш ймовірний токен на кожному кроці. Запусти двічі — отримаєш однакову відповідь. Це і є справжній baseline.
+
 ### Чому важливо порівняти кілька моделей?
 
 - **Qwen-7B (локально)**: безкоштовно, потужна, але може не знати регіональне законодавство
@@ -63,6 +79,27 @@ messages=[
 - Питань що тобі самому задавали по темі
 - "Люди також шукають" в Google
 
+### Крок 2: Допоміжна функція — підрахунок токенів
+
+Перед запуском — додай цю утиліту. Вона показує скільки токенів ти відправляєш **до** того як платиш:
+
+```python
+# experiments/token_utils.py
+import tiktoken
+
+def count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
+    """Рахує токени локально, безкоштовно, до відправки запиту."""
+    enc = tiktoken.encoding_for_model(model)
+    return len(enc.encode(text))
+
+def estimate_cost(input_tokens: int, output_tokens: int,
+                  price_in: float = 0.15, price_out: float = 0.60) -> float:
+    """GPT-4o-mini: $0.15/1M input, $0.60/1M output."""
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+```
+
+### Крок 3: Основний скрипт
+
 ```python
 # experiments/01_first_fight.py
 """
@@ -70,9 +107,11 @@ messages=[
 Це baseline — точка відліку для всього курсу.
 """
 import json
+import time
 import ollama
 from openai import OpenAI
 from pathlib import Path
+from token_utils import count_tokens, estimate_cost
 
 # ================================================================
 # НАЛАШТУЙ ЦЕ ПІД СВОЮ НІШУ — замни на свої питання!
@@ -103,6 +142,7 @@ QUESTIONS = [
 # ================================================================
 
 client = OpenAI()
+total_cost = 0.0
 
 print(f"🥊 ПЕРШИЙ БІЙ: {NICHE}")
 print(f"📋 Питань: {len(QUESTIONS)}\n")
@@ -112,30 +152,66 @@ results = []
 
 for i, question in enumerate(QUESTIONS):
     print(f"[{i+1:2d}/{len(QUESTIONS)}] {question[:55]}...", end=" ", flush=True)
-    
+
     row = {"question": question, "answers": {}}
-    
-    # Суперник 1: Qwen-7B без промпту (локально, безкоштовно)
+
+    # --- Суперник 1: Qwen-7B без промпту (локально, безкоштовно) ---
+    t0 = time.perf_counter()
     resp = ollama.chat(
         model='qwen2.5:7b',
-        messages=[{'role': 'user', 'content': question}]
+        messages=[{'role': 'user', 'content': question}],
+        options={"temperature": 0},
     )
-    row["answers"]["qwen7b_zero"] = resp['message']['content']
-    
-    # Суперник 2: GPT-4o без промпту
+    row["answers"]["qwen7b_zero"] = {
+        "text":        resp['message']['content'],
+        "latency_sec": round(time.perf_counter() - t0, 2),
+        "cost_usd":    0.0,  # локально — безкоштовно
+    }
+
+    # --- Суперник 2: GPT-4o без промпту ---
+    input_tk = count_tokens(question)
+    t0 = time.perf_counter()
     resp = client.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "user", "content": question}]
+        messages=[{"role": "user", "content": question}],
+        temperature=0,
+        seed=42,
+        max_tokens=600,
     )
-    row["answers"]["gpt4o_zero"] = resp.choices[0].message.content
-    
-    # Суперник 3: GPT-4o-mini без промпту (дешевший)
+    elapsed = round(time.perf_counter() - t0, 2)
+    cost = estimate_cost(
+        resp.usage.prompt_tokens, resp.usage.completion_tokens,
+        price_in=2.50, price_out=10.00,  # GPT-4o pricing
+    )
+    total_cost += cost
+    row["answers"]["gpt4o_zero"] = {
+        "text":          resp.choices[0].message.content,
+        "latency_sec":   elapsed,
+        "input_tokens":  resp.usage.prompt_tokens,
+        "output_tokens": resp.usage.completion_tokens,
+        "cost_usd":      round(cost, 6),
+    }
+
+    # --- Суперник 3: GPT-4o-mini без промпту (дешевший) ---
+    t0 = time.perf_counter()
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": question}]
+        messages=[{"role": "user", "content": question}],
+        temperature=0,
+        seed=42,
+        max_tokens=600,
     )
-    row["answers"]["gpt4o_mini_zero"] = resp.choices[0].message.content
-    
+    elapsed = round(time.perf_counter() - t0, 2)
+    cost = estimate_cost(resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    total_cost += cost
+    row["answers"]["gpt4o_mini_zero"] = {
+        "text":          resp.choices[0].message.content,
+        "latency_sec":   elapsed,
+        "input_tokens":  resp.usage.prompt_tokens,
+        "output_tokens": resp.usage.completion_tokens,
+        "cost_usd":      round(cost, 6),
+    }
+
     results.append(row)
     print("✅")
 
@@ -145,9 +221,13 @@ with open("data/first_fight_results.jsonl", "w", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 print(f"\n✅ Збережено: data/first_fight_results.jsonl")
-print(f"💰 Приблизна вартість: ~${len(QUESTIONS) * 0.002:.2f}")
+print(f"💰 Реальна вартість цього запуску: ${total_cost:.4f}")
+print(f"   (GPT-4o дорогий — далі використовуємо mini для ітерацій, GPT-4o тільки для фіналу)")
 print("\nНаступний крок: аналіз результатів (урок нижче)")
 ```
+
+> 💰 **Вартість уроку:** ~$0.05–0.15 (20 питань × 3 моделі, GPT-4o найдорожчий).  
+> Надалі GPT-4o беремо тільки для фінального порівняння. Решту часу — GPT-4o-mini або Ollama.
 
 ---
 
@@ -157,7 +237,24 @@ print("\nНаступний крок: аналіз результатів (ур�
 
 ### Крок 1: Прочитати всі відповіді
 
-Відкрий `data/first_fight_results.jsonl`. Для кожного питання прочитай 3 відповіді.
+Скористайся скриптом для зручного перегляду:
+
+```python
+import json
+
+with open("data/first_fight_results.jsonl") as f:
+    results = [json.loads(line) for line in f]
+
+# Показати відповіді на конкретне питання
+idx = 0  # змінюй на 0-19
+print(f"ПИТАННЯ: {results[idx]['question']}\n")
+for model, data in results[idx]['answers'].items():
+    print(f"=== {model.upper()} | {data['latency_sec']}s | ${data['cost_usd']:.6f} ===")
+    print(data['text'][:500])
+    print()
+```
+
+Побічний продукт: ти відразу бачиш різницю в latency між Ollama (2–8с) і GPT-4o-mini (1–3с).
 
 ### Крок 2: Заповнити таблицю оцінок
 
@@ -173,8 +270,8 @@ print("\nНаступний крок: аналіз результатів (ур�
 ...
 
 ## Загальні оцінки
-- Qwen-7B середнє: ___ / 5
-- GPT-4o середнє:  ___ / 5  ← це твій бар'єр. Маєш побити його.
+- Qwen-7B середнє:    ___ / 5
+- GPT-4o середнє:     ___ / 5  ← це твій бар'єр. Маєш побити його.
 - GPT-4o-mini середнє: ___ / 5
 ```
 
@@ -219,9 +316,21 @@ print("\nНаступний крок: аналіз результатів (ур�
 ## ✅ Самоперевірка
 
 1. `data/first_fight_results.jsonl` існує і містить 20 рядків?
-2. `data/fight_analysis.md` заповнений (таблиця оцінок + мінімум 3 патерни)?
-3. Ти знаєш середній score GPT-4o zero-shot для своєї ніші?
-4. Ти сформулював бойовий план — що конкретно виправлятимеш?
+2. Кожна відповідь має поля `text`, `latency_sec`, `cost_usd`?
+3. `data/fight_analysis.md` заповнений (таблиця оцінок + мінімум 3 патерни)?
+4. Ти знаєш середній score GPT-4o zero-shot для своєї ніші?
+5. Ти сформулював бойовий план — що конкретно виправлятимеш?
+
+---
+
+## ⚠️ Типові помилки
+
+| Помилка | Реальність |
+|---------|-----------|
+| "Zero-shot = чесне порівняння" | Без `temperature=0` кожен запуск різний — це не baseline, це шум |
+| "20 питань достатньо" | 20 питань дає ±14% похибку. Прийнятно для старту, не для фінальних рішень |
+| "GPT-4o завжди найкращий" | На вузькій ніші GPT-4o-mini може бути точнішим і в 17x дешевшим |
+| "Baseline = кінцева якість" | Baseline — це floor, не ceiling. Мета курсу — побити його своїм промптом |
 
 ---
 
@@ -231,7 +340,7 @@ print("\nНаступний крок: аналіз результатів (ур�
 - Забагато запитів підряд. Додай `time.sleep(1)` між питаннями:
 ```python
 import time
-# після кожного row.append(row):
+# після кожного results.append(row):
 time.sleep(1)
 ```
 
@@ -241,31 +350,11 @@ time.sleep(1)
 
 ### Деякі відповіді порожні або `None`
 - Модель повернула порожню відповідь (буває рідко)
-- Додай перевірку: `row["answers"]["qwen7b_zero"] = resp['message']['content'] or "EMPTY_RESPONSE"`
+- Додай перевірку: `text = resp['message']['content'] or "EMPTY_RESPONSE"`
 
 ### `JSONDecodeError` при читанні файлу
 - Файл пошкоджений (скрипт впав посередині)
 - Видали файл і запусти знову: `del data/first_fight_results.jsonl`
-
----
-
-## 💡 Лайфхак: читати JSONL файли
-
-```python
-# Прочитати і відобразити зручно:
-import json
-
-with open("data/first_fight_results.jsonl") as f:
-    results = [json.loads(line) for line in f]
-
-# Показати відповіді на конкретне питання
-idx = 0  # змінюй на 0-19
-print(f"ПИТАННЯ: {results[idx]['question']}\n")
-for model, answer in results[idx]['answers'].items():
-    print(f"=== {model.upper()} ===")
-    print(answer[:500])
-    print()
-```
 
 ---
 
